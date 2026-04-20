@@ -15,6 +15,10 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include "index.h"
+// Forward declarations for object store functions
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out);
 
 // ─── Mode Constants ─────────────────────────────────────────────────────────
 
@@ -129,9 +133,86 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //   - object_write    : save that binary buffer to the store as OBJ_TREE
 //
 // Returns 0 on success, -1 on error.
+// Helper: write one level of the tree (entries sharing the same directory prefix)
+static int write_tree_level(IndexEntry *entries, int count, int depth, ObjectID *id_out) {
+    Tree tree;
+    tree.count = 0;
+
+    int i = 0;
+    while (i < count) {
+        // Find the component at this depth level
+        const char *path = entries[i].path;
+
+        // Skip 'depth' levels of directory components
+        const char *p = path;
+        for (int d = 0; d < depth; d++) {
+            p = strchr(p, '/');
+            if (!p) return -1;
+            p++; // skip the '/'
+        }
+
+        // Is there another '/' after this level? If yes, it's a subdirectory
+        const char *slash = strchr(p, '/');
+
+        if (slash == NULL) {
+            // It's a file at this level — add directly as blob entry
+            TreeEntry *entry = &tree.entries[tree.count++];
+            entry->mode = entries[i].mode;
+            strncpy(entry->name, p, sizeof(entry->name) - 1);
+            entry->name[sizeof(entry->name) - 1] = '\0';
+            memcpy(entry->hash.hash, entries[i].hash.hash, HASH_SIZE);
+            i++;
+        } else {
+            // It's a subdirectory — find all entries sharing this prefix
+            char dir_name[256];
+            size_t dir_len = slash - p;
+            strncpy(dir_name, p, dir_len);
+            dir_name[dir_len] = '\0';
+
+            // Find the range of entries belonging to this subdir
+            int j = i;
+            while (j < count) {
+                const char *pp = entries[j].path;
+                for (int d = 0; d < depth; d++) {
+                    pp = strchr(pp, '/');
+                    if (!pp) break;
+                    pp++;
+                }
+                if (pp && strncmp(pp, dir_name, dir_len) == 0 && pp[dir_len] == '/') {
+                    j++;
+                } else {
+                    break;
+                }
+            }
+
+            // Recursively build subtree
+            ObjectID sub_id;
+            if (write_tree_level(entries + i, j - i, depth + 1, &sub_id) < 0)
+                return -1;
+
+            // Add subtree entry
+            TreeEntry *entry = &tree.entries[tree.count++];
+            entry->mode = 0040000;
+            strncpy(entry->name, dir_name, sizeof(entry->name) - 1);
+            entry->name[sizeof(entry->name) - 1] = '\0';
+            memcpy(entry->hash.hash, sub_id.hash, HASH_SIZE);
+
+            i = j;
+        }
+    }
+
+    // Serialize and write this tree level
+    void *data;
+    size_t len;
+    if (tree_serialize(&tree, &data, &len) < 0) return -1;
+    int ret = object_write(OBJ_TREE, data, len, id_out);
+    free(data);
+    return ret;
+}
+
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    Index idx;
+    if (index_load(&idx) < 0) return -1;
+    if (idx.count == 0) return -1;
+    return write_tree_level(idx.entries, idx.count, 0, id_out);
 }
